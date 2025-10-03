@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebSocket Client</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="container">
+      <header class="page-header">
+        <h1>WebSocket Client</h1>
+        <p class="subtitle">Connect, send messages, and inspect responses.</p>
+      </header>
+
+      <section class="grid">
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">Connection</h2>
+          </div>
+          <div class="card-body">
+            <label for="server-ip" class="label">Server URI</label>
+            <div class="row">
+              <input id="server-ip" class="input" />
+              <button id="connect-bt" class="btn btn-primary">Connect</button>
+            </div>
+            <p class="hint">Example: ws://127.0.0.1:8080/</p>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">Message</h2>
+          </div>
+          <div class="card-body">
+            <div class="row">
+              <input id="message" class="input" placeholder="Type a message" />
+            </div>
+            <div class="row">
+              <button id="send-message" class="btn btn-primary">Send</button>
+              <button id="send-message-binary" class="btn">Send as Binary</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h2 class="card-title">Sample Queries</h2>
+          </div>
+          <div class="card-body samples">
+            <div class="sample">
+              <pre class="sample-code" data-text="Hello, WebSocket!">Hello, WebSocket!</pre>
+              <button class="btn btn-ghost copy-btn" data-copy>Copy</button>
+            </div>
+            <div class="sample">
+              <pre class="sample-code" data-text='{"op":"status"}'>
+{"op":"status"}
+              </pre>
+              <button class="btn btn-ghost copy-btn" data-copy>Copy</button>
+            </div>
+            <div class="sample">
+              <pre class="sample-code" data-text='{"op":"echo","data":"Sample payload"}'>
+{"op":"echo","data":"Sample payload"}
+              </pre>
+              <button class="btn btn-ghost copy-btn" data-copy>Copy</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <h2 class="card-title">Output</h2>
+        </div>
+        <div class="card-body" id="output-wrapper">
+          <div id="output" class="output"></div>
+        </div>
+      </section>
+    </main>
+
+    <script src="app.js" defer></script>
+  </body>
+  
+</html>
