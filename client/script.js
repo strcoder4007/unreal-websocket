@@ -4,13 +4,17 @@
 
 import { Conversation } from '@elevenlabs/client';
 
-const startButton = document.getElementById('startButton');
-const stopButton = document.getElementById('stopButton');
 const connectionStatus = document.getElementById('connectionStatus');
 const agentStatus = document.getElementById('agentStatus');
 const agentAudioEl = document.getElementById('agentAudio');
 const localWsStatusEl = document.getElementById('localWsStatus');
-const lastSttTextEl = document.getElementById('lastSttText');
+const messagesEl = document.getElementById('messages');
+const micButton = document.getElementById('micButton');
+const sendButton = document.getElementById('sendButton');
+const chatInput = document.getElementById('chatInput');
+const connBadge = document.getElementById('connBadge');
+const modeBadge = document.getElementById('modeBadge');
+const wsBadge = document.getElementById('wsBadge');
 
 // Configuration: set your Agent ID here for public agents
 // For private agents, leave this as null and enable SIGNED_URL_FLOW below.
@@ -30,8 +34,60 @@ let localWSConnecting = false;
 let lastForwardedText = '';
 let lastForwardedAt = 0;
 
+// Messages state
+let messages = [];
+let msgSeq = 0;
+let lastAppendedText = '';
+let lastAppendedAt = 0;
+let currentMode = 'idle';
+let userWindowUntil = 0;
+
+function tsShort(d = new Date()) {
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function appendMessage(role, text, source = 'onMessage') {
+  if (!text) return;
+  const now = Date.now();
+  if (text === lastAppendedText && now - lastAppendedAt < 1500) {
+    // avoid spammy duplicates across onMessage/STT
+  } else {
+    messages.push({ id: ++msgSeq, role, text, source, ts: new Date() });
+    lastAppendedText = text;
+    lastAppendedAt = now;
+  }
+  renderMessages();
+}
+
+function renderMessages() {
+  if (!messagesEl) return;
+  let html = '';
+  for (const m of messages.slice(-400)) {
+    const roleClass = m.role === 'user' ? 'user' : (m.role === 'stt' ? 'stt' : 'agent');
+    const tag = m.role === 'user' ? 'Me' : (m.role === 'stt' ? 'Agent' : 'Agent');
+    html += `
+      <div class="msg-row ${roleClass}">
+        <div class="bubble ${roleClass}">
+          <div class="meta"><span class="tag ${roleClass}">${tag}</span><span>${tsShort(m.ts)}</span></div>
+          <div class="content">${escapeHtml(m.text)}</div>
+        </div>
+      </div>`;
+  }
+  messagesEl.innerHTML = html;
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
 function setLocalWsStatus(text) {
   if (localWsStatusEl) localWsStatusEl.textContent = text;
+  if (!wsBadge) return;
+  wsBadge.classList.remove('ok','warn','err');
+  if (text === 'connected') wsBadge.classList.add('ok');
+  else if (text === 'error') wsBadge.classList.add('err');
+  else wsBadge.classList.add('warn');
 }
 
 function connectLocalWS() {
@@ -91,6 +147,19 @@ let recordingActive = false;
 let sttInFlight = 0;
 const MAX_IN_FLIGHT = 2;
 const CHUNK_MS = 4000; // tune latency vs accuracy
+let convActive = false;
+
+function setConnectedUI(connected) {
+  convActive = connected;
+  if (micButton) {
+    micButton.classList.toggle('active', connected);
+    micButton.setAttribute('aria-pressed', String(connected));
+  }
+  if (connBadge) {
+    connBadge.classList.remove('ok','warn','err');
+    connBadge.classList.add(connected ? 'ok' : 'err');
+  }
+}
 
 async function getSignedUrl() {
   const response = await fetch('http://localhost:3001/api/get-signed-url');
@@ -121,25 +190,33 @@ async function startConversation() {
       ...options,
       onConnect: () => {
         connectionStatus.textContent = 'Connected';
-        startButton.disabled = true;
-        stopButton.disabled = false;
+        setConnectedUI(true);
       },
       onDisconnect: () => {
         connectionStatus.textContent = 'Disconnected';
-        startButton.disabled = false;
-        stopButton.disabled = true;
+        setConnectedUI(false);
       },
       onError: (error) => {
         console.error('Error:', error);
       },
       onModeChange: (mode) => {
-        agentStatus.textContent = mode.mode === 'speaking' ? 'speaking' : 'listening';
+        currentMode = mode.mode || 'idle';
+        agentStatus.textContent = currentMode;
+        if (modeBadge) {
+          modeBadge.classList.remove('ok','warn','err');
+          if (currentMode === 'speaking') modeBadge.classList.add('warn');
+          else if (currentMode === 'listening') modeBadge.classList.add('ok');
+          else modeBadge.classList.add('warn');
+        }
+        // Short window where incoming onMessage is treated as user transcripts
+        if (currentMode === 'listening') userWindowUntil = Date.now() + 6000; else userWindowUntil = 0;
       },
       onMessage: (msg) => {
         const text = typeof msg === 'string' ? msg : (msg && (msg.text || msg.message || msg.content));
         if (text) {
-          if (lastSttTextEl) lastSttTextEl.textContent = text;
           forwardTextToLocalWS(text);
+          const role = classifyIncomingMessage(msg);
+          appendMessage(role, text, 'onMessage');
         }
       },
     });
@@ -161,8 +238,31 @@ async function stopConversation() {
   stopAgentAudioCapture();
 }
 
-startButton.addEventListener('click', startConversation);
-stopButton.addEventListener('click', stopConversation);
+// Mic toggle and mock send
+if (micButton) {
+  micButton.addEventListener('click', async () => {
+    if (!convActive) {
+      await startConversation();
+    } else {
+      await stopConversation();
+      setConnectedUI(false);
+    }
+  });
+}
+if (sendButton && chatInput) {
+  sendButton.addEventListener('click', () => {
+    const val = chatInput.value.trim();
+    if (!val) return;
+    appendMessage('user', val, 'mock');
+    chatInput.value = '';
+  });
+  chatInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendButton.click();
+    }
+  });
+}
 
 // Attempt to resolve agent output audio stream for recording
 function resolveAgentOutputStream() {
@@ -207,8 +307,8 @@ function tryStartAgentAudioCapture() {
     try {
       const text = await sttChunk(ev.data);
       if (text) {
-        if (lastSttTextEl) lastSttTextEl.textContent = text;
         forwardTextToLocalWS(text);
+        appendMessage('agent', text, 'stt');
       }
     } catch (err) {
       console.error('STT chunk failed:', err);
@@ -240,4 +340,28 @@ async function sttChunk(blob) {
   }
   const data = await res.json();
   return data && (data.text || data.transcript || data.transcription || data.result);
+}
+
+// Initialize status and local WS
+setConnectedUI(false);
+if (modeBadge && agentStatus) {
+  modeBadge.classList.remove('ok','warn','err');
+  modeBadge.classList.add('warn');
+  agentStatus.textContent = 'idle';
+}
+connectLocalWS();
+function classifyIncomingMessage(msg) {
+  // Try to infer whether this message comes from the user (mic) or agent
+  if (msg && typeof msg === 'object') {
+    const lower = (v) => (typeof v === 'string' ? v.toLowerCase() : v);
+    const role = lower(msg.role || msg.author || msg.sender || msg.from || msg.source || msg.origin);
+    const type = lower(msg.type || msg.messageType);
+    if (role === 'user' || role === 'me' || role === 'client' || role === 'speaker' || role === 'microphone') return 'user';
+    if (role === 'agent' || role === 'assistant' || role === 'system' || role === 'llm') return 'agent';
+    if (type && (String(type).includes('user') || String(type).includes('transcript'))) return 'user';
+  }
+  // Fallback to time-window + mode heuristic
+  const now = Date.now();
+  if (now < userWindowUntil) return 'user';
+  return currentMode === 'listening' ? 'user' : 'agent';
 }
