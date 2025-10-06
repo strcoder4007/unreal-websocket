@@ -1,65 +1,41 @@
-# Unreal WebSocket — Browser Client
+# ElevenLabs Agents – Voice Conversation (Vite)
 
-A lightweight, dependency‑free WebSocket client you can open in a browser to connect to any WebSocket server, send text or binary messages, and inspect responses. No build step or package manager required.
+This repo contains a Vite-based frontend that enables voice conversations with ElevenLabs AI agents, plus an optional backend for generating signed URLs when working with private agents.
 
-## Features
-- Connect to any WebSocket URI (default: `ws://127.0.0.1:8080/`).
-- Send text or binary (Blob) messages.
-- Copyable sample messages for quick testing.
-- Scrollback output with simple status and error reporting.
+Structure
+- `client/` — Vite root with `index.html` and `script.js`.
+- `backend/` — optional Express server exposing `/api/get-signed-url`.
+- `AGENTS.md` — guidance for working in this repo.
 
-## Quick Start
-1. Serve the static files (avoid `file://` so Clipboard APIs work):
-   - Python: `python3 -m http.server 8000`
-   - Then open `http://localhost:8000/websocket.html`
-2. Enter your WebSocket URI and click `Connect`.
-3. Type a message and click `Send` (or press Enter) — or use `Send as Binary` for Blob payloads.
+Prerequisites
+- Node.js and npm installed
+- An ElevenLabs Agent ID (public or private)
 
-## Example Echo Server (Node.js)
-If you need something to talk to while testing, this minimal echo server using `ws` will do:
-
-```js
-// save as server.js
-const WebSocket = require('ws');
-const wss = new WebSocket.Server({ port: 8080 });
-
-wss.on('connection', (ws) => {
-  ws.send('Connected to echo server');
-  ws.on('message', (data) => {
-    // Echo back what we received
-    ws.send(data);
-  });
-});
-
-console.log('ws echo server listening on ws://127.0.0.1:8080/');
-```
-
-Run with:
-
+Install dependencies
 ```bash
-npm init -y && npm i ws
-node server.js
+npm install
 ```
 
-Then connect from the client using `ws://127.0.0.1:8080/`.
+Configure agent
+- Public agent: set your Agent ID in `client/script.js` (`AGENT_ID`).
+- Private agent (optional): copy `backend/.env.example` to `.env` at repo root or inside `backend/`, and set:
+  - `ELEVENLABS_API_KEY=...`
+  - `AGENT_ID=...`
 
-## Usage Tips
-- Use the `Copy` buttons under Sample Queries to quickly try messages.
-- The output panel auto‑scrolls as new messages arrive.
-- Binary messages are displayed by converting Blob to text.
+Run
+- Frontend only (public agent):
+  ```bash
+  npm run dev:frontend
+  ```
+  Visit the URL Vite prints (default http://localhost:5173) and click “Start Conversation”.
 
-## Project Structure
-- `websocket.html` — UI and layout; loads the script and stylesheet.
-- `app.js` — WebSocket connection and UI logic.
-- `styles.css` — Styling; dark, minimal theme.
+- Frontend + backend (private agent):
+  ```bash
+  npm run dev
+  ```
+  Frontend runs via Vite and backend runs on http://localhost:3001.
+  In `client/script.js`, set `SIGNED_URL_FLOW = true`.
 
-## Development Notes
-- This is a static project; please don’t introduce build tools or frameworks.
-- Keep changes small and consistent with the existing style.
-- See `AGENTS.md` for conventions and guidance for contributors and coding agents.
-
-## Troubleshooting
-- Mixed content: Browsers block `ws://` from `https://` origins. Use `http://` for local dev, or use `wss://` with HTTPS.
-- Connection fails immediately: Check that your server is running and reachable from the browser (CORS is not applicable to WebSockets, but networks/firewalls can still block ports).
-- Clipboard copy doesn’t work: Serve over `http://localhost` rather than opening via `file://`.
-
+Notes
+- The frontend imports `@elevenlabs/client` and calls `Conversation.startSession` with either `agentId` or `signedUrl`, mirroring the ElevenLabs quickstart.
+- For production, add error handling and URL refresh logic for expiring signed URLs.

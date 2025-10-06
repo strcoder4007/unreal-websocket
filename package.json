@@ -1,0 +1,20 @@
+{
+  "name": "unreal-websocket",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev:frontend": "vite client",
+    "dev:backend": "node backend/server.js",
+    "dev": "npm run dev:frontend & npm run dev:backend"
+  },
+  "dependencies": {
+    "@elevenlabs/client": "0.7.1",
+    "express": "^4.19.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.0"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0"
+  }
+}
+
