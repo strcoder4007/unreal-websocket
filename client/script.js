@@ -271,9 +271,12 @@ async function startConversation() {
       onMessage: (msg) => {
         const text = typeof msg === 'string' ? msg : (msg && (msg.text || msg.message || msg.content));
         if (text) {
-          forwardTextToLocalWS(text);
           const role = classifyIncomingMessage(msg);
           appendMessage(role, text, 'onMessage');
+          // Only forward non-user messages to the local Unreal WS
+          if (role !== 'user') {
+            forwardTextToLocalWS(text);
+          }
         }
       },
     });
