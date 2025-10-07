@@ -33,6 +33,9 @@ let localWSBackoff = 500; // ms
 let localWSConnecting = false;
 let lastForwardedText = '';
 let lastForwardedAt = 0;
+// Keep a small rolling buffer so we can accumulate partial sentences
+// across multiple calls and only send complete sentences.
+let _sentenceBuffer = '';
 
 // Messages state
 let messages = [];
@@ -123,21 +126,75 @@ function connectLocalWS() {
   }
 }
 
-function forwardTextToLocalWS(text) {
-  if (!text) return;
-  const now = Date.now();
-  if (text === lastForwardedText && now - lastForwardedAt < 2000) {
-    return; // dedupe burst duplicates
+// Heuristic sentence segmentation with basic abbreviation and decimal handling.
+function _extractSentences(input) {
+  const ABBREV = new Set([
+    'mr.', 'mrs.', 'ms.', 'dr.', 'prof.', 'sr.', 'jr.', 'vs.', 'etc.',
+    'e.g.', 'i.e.', 'fig.', 'st.', 'no.', 'pp.', 'vol.', 'inc.', 'ltd.',
+    'u.s.', 'u.k.', 'u.s.a.'
+  ]);
+  const isDigit = (c) => c >= '0' && c <= '9';
+  const prevWord = (str, idx) => {
+    let i = idx - 1;
+    while (i >= 0 && !/\s/.test(str[i])) i--;
+    const w = str.slice(i + 1, idx + 1).trim();
+    return w.toLowerCase();
+  };
+
+  const sentences = [];
+  const CLOSERS = new Set(['"', ')', "'", ']', '}']);
+  let start = 0;
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (ch === '.' || ch === '!' || ch === '?') {
+      // Skip decimal numbers like 3.14
+      const prev = input[i - 1];
+      const next = input[i + 1];
+      if (ch === '.' && isDigit(prev || '') && isDigit(next || '')) continue;
+      // Skip common abbreviations (e.g., Mr., Dr., e.g.)
+      const w = prevWord(input, i);
+      if (ABBREV.has(w)) continue;
+      // Include closing quotes or parentheses right after punctuation
+      let end = i + 1;
+      while (end < input.length && CLOSERS.has(input[end])) end++;
+      const sentence = input.slice(start, end).trim();
+      if (sentence) sentences.push(sentence);
+      start = end;
+      i = end - 1;
+    }
   }
-  lastForwardedText = text;
-  lastForwardedAt = now;
-  const payload = `lstext^${text}`;
+  const remainder = input.slice(start).trim();
+  return { sentences, remainder };
+}
+
+function _sendLocal(payload) {
   if (localWSConnected && localWS && localWS.readyState === WebSocket.OPEN) {
     try { localWS.send(payload); } catch (_) {}
   } else {
     localWSQueue.push(payload);
     if (localWSQueue.length > 50) localWSQueue.shift();
     connectLocalWS();
+  }
+}
+
+function forwardTextToLocalWS(text) {
+  if (!text) return;
+  // Accumulate into buffer so we can split on sentence boundaries
+  const combined = _sentenceBuffer ? `${_sentenceBuffer} ${String(text)}` : String(text);
+  const { sentences, remainder } = _extractSentences(combined);
+  _sentenceBuffer = remainder; // keep any trailing incomplete fragment
+
+  if (sentences.length === 0) {
+    // Nothing complete to send yet.
+    return;
+  }
+
+  for (const s of sentences) {
+    const now = Date.now();
+    if (s === lastForwardedText && now - lastForwardedAt < 2000) continue; // dedupe burst duplicates
+    lastForwardedText = s;
+    lastForwardedAt = now;
+    _sendLocal(`lstext^${s}`);
   }
 }
 
