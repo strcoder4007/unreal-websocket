@@ -29,9 +29,9 @@ let localWSBackoff = 500; // ms
 let localWSConnecting = false;
 let lastForwardedText = '';
 let lastForwardedAt = 0;
-// Keep a small rolling buffer so we can accumulate partial sentences
-// across multiple calls and only send complete sentences.
-let _sentenceBuffer = '';
+// Buffer for the current agent speaking turn (for STT). We accumulate
+// partial transcriptions and flush once the agent finishes speaking.
+let sttTurnBuffer = '';
 
 // Messages state
 let messages = [];
@@ -123,45 +123,7 @@ function connectLocalWS() {
 }
 
 // Heuristic sentence segmentation with basic abbreviation and decimal handling.
-function _extractSentences(input) {
-  const ABBREV = new Set([
-    'mr.', 'mrs.', 'ms.', 'dr.', 'prof.', 'sr.', 'jr.', 'vs.', 'etc.',
-    'e.g.', 'i.e.', 'fig.', 'st.', 'no.', 'pp.', 'vol.', 'inc.', 'ltd.',
-    'u.s.', 'u.k.', 'u.s.a.'
-  ]);
-  const isDigit = (c) => c >= '0' && c <= '9';
-  const prevWord = (str, idx) => {
-    let i = idx - 1;
-    while (i >= 0 && !/\s/.test(str[i])) i--;
-    const w = str.slice(i + 1, idx + 1).trim();
-    return w.toLowerCase();
-  };
-
-  const sentences = [];
-  const CLOSERS = new Set(['"', ')', "'", ']', '}']);
-  let start = 0;
-  for (let i = 0; i < input.length; i++) {
-    const ch = input[i];
-    if (ch === '.' || ch === '!' || ch === '?') {
-      // Skip decimal numbers like 3.14
-      const prev = input[i - 1];
-      const next = input[i + 1];
-      if (ch === '.' && isDigit(prev || '') && isDigit(next || '')) continue;
-      // Skip common abbreviations (e.g., Mr., Dr., e.g.)
-      const w = prevWord(input, i);
-      if (ABBREV.has(w)) continue;
-      // Include closing quotes or parentheses right after punctuation
-      let end = i + 1;
-      while (end < input.length && CLOSERS.has(input[end])) end++;
-      const sentence = input.slice(start, end).trim();
-      if (sentence) sentences.push(sentence);
-      start = end;
-      i = end - 1;
-    }
-  }
-  const remainder = input.slice(start).trim();
-  return { sentences, remainder };
-}
+// Removed sentence chunking: we now forward the full text only.
 
 function _sendLocal(payload) {
   if (localWSConnected && localWS && localWS.readyState === WebSocket.OPEN) {
@@ -175,23 +137,13 @@ function _sendLocal(payload) {
 
 function forwardTextToLocalWS(text) {
   if (!text) return;
-  // Accumulate into buffer so we can split on sentence boundaries
-  const combined = _sentenceBuffer ? `${_sentenceBuffer} ${String(text)}` : String(text);
-  const { sentences, remainder } = _extractSentences(combined);
-  _sentenceBuffer = remainder; // keep any trailing incomplete fragment
-
-  if (sentences.length === 0) {
-    // Nothing complete to send yet.
-    return;
-  }
-
-  for (const s of sentences) {
-    const now = Date.now();
-    if (s === lastForwardedText && now - lastForwardedAt < 2000) continue; // dedupe burst duplicates
-    lastForwardedText = s;
-    lastForwardedAt = now;
-    _sendLocal(`lstext^${s}`);
-  }
+  const s = String(text).trim();
+  if (!s) return;
+  const now = Date.now();
+  if (s === lastForwardedText && now - lastForwardedAt < 2000) return; // basic dedupe
+  lastForwardedText = s;
+  lastForwardedAt = now;
+  _sendLocal(`lstext^${s}`);
 }
 
 let conversation;
@@ -271,6 +223,7 @@ async function startConversation() {
         console.error('Error:', error);
       },
       onModeChange: (mode) => {
+        const prevMode = currentMode;
         currentMode = mode.mode || 'idle';
         if (currentMode === 'speaking') updateMicState('speaking');
         else if (currentMode === 'listening') updateMicState('listening');
@@ -279,7 +232,13 @@ async function startConversation() {
         if (currentMode === 'listening') userWindowUntil = Date.now() + 6000; else userWindowUntil = 0;
         // Attempt to start agent audio capture when the agent begins speaking
         if (currentMode === 'speaking') {
+          // New agent turn: reset STT accumulation buffer
+          sttTurnBuffer = '';
           tryStartAgentAudioCapture();
+        }
+        // If we just finished speaking, flush accumulated STT as one message
+        if (prevMode === 'speaking' && currentMode !== 'speaking') {
+          flushSttTurnBuffer();
         }
       },
       onMessage: (msg) => {
@@ -287,7 +246,8 @@ async function startConversation() {
         if (text) {
           const role = classifyIncomingMessage(msg);
           appendMessage(role, text, 'onMessage');
-          // Only forward non-user messages to the local Unreal WS
+          // Only forward non-user messages to the local Unreal WS.
+          // With chunking removed, this sends the complete text when provided by the SDK.
           if (role !== 'user') {
             forwardTextToLocalWS(text);
           }
@@ -388,7 +348,8 @@ function tryStartAgentAudioCapture() {
     try {
       const text = await sttChunk(ev.data);
       if (text) {
-        forwardTextToLocalWS(text);
+        // Accumulate STT into the current speaking-turn buffer. Do not send yet.
+        sttTurnBuffer = sttTurnBuffer ? `${sttTurnBuffer} ${text}` : String(text);
         appendMessage('agent', text, 'stt');
       }
     } catch (err) {
@@ -413,6 +374,8 @@ function stopAgentAudioCapture() {
   try { if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop(); } catch (_) {}
   mediaRecorder = null;
   recordingActive = false;
+  // Flush any remaining STT that wasn't sent yet
+  flushSttTurnBuffer();
 }
 
 async function sttChunk(blob) {
@@ -428,6 +391,13 @@ async function sttChunk(blob) {
   }
   const data = await res.json();
   return data && (data.text || data.transcript || data.transcription || data.result);
+}
+
+function flushSttTurnBuffer() {
+  const full = String(sttTurnBuffer || '').trim();
+  if (!full) return;
+  forwardTextToLocalWS(full);
+  sttTurnBuffer = '';
 }
 
 // Initialize status and local WS

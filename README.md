@@ -44,9 +44,9 @@ Voice-to-Text forwarding to local WebSocket
 - The frontend attempts two paths to obtain text:
   - onMessage callback from the Agents SDK (low latency, robust)
   - Optional audio capture of agent output with MediaRecorder -> POST chunks to `backend` STT -> map to text
-- Every text snippet is forwarded to `ws://127.0.0.1:8080` with `lstext^` prefix via a resilient WebSocket client.
+- Complete agent responses (no sentence chunking) are forwarded once per speaking turn to `ws://127.0.0.1:8080` with `lstext^` prefix via a resilient WebSocket client.
 - Configure in `client/script.js`:
   - `LOCAL_WS_URL` if your local server is different
-  - `CHUNK_MS` for STT latency vs accuracy
+  - `CHUNK_MS` controls MediaRecorder chunking; STT chunks are internally accumulated and only the final combined transcript is sent
   - `MAX_IN_FLIGHT` to cap concurrent STT requests
 - Backend STT route: `POST http://localhost:3001/api/stt-chunk` accepts `audio/webm` (and some other audio mime types) and calls ElevenLabs STT. Requires `ELEVENLABS_API_KEY`.
