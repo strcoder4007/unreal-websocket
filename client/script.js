@@ -5,20 +5,16 @@
 import { Conversation } from '@elevenlabs/client';
 
 const connectionStatus = document.getElementById('connectionStatus');
-const agentStatus = document.getElementById('agentStatus');
 const agentAudioEl = document.getElementById('agentAudio');
 const localWsStatusEl = document.getElementById('localWsStatus');
 const messagesEl = document.getElementById('messages');
 const micButton = document.getElementById('micButton');
-const sendButton = document.getElementById('sendButton');
-const chatInput = document.getElementById('chatInput');
 const connBadge = document.getElementById('connBadge');
-const modeBadge = document.getElementById('modeBadge');
 const wsBadge = document.getElementById('wsBadge');
 
 // Configuration: set your Agent ID here for public agents
 // For private agents, leave this as null and enable SIGNED_URL_FLOW below.
-const AGENT_ID = 'agent_0101k6w6hvhjfyb8h0ph5q0ebwn8'; // TODO: replace with your actual agent ID
+const AGENT_ID = 'agent_9201k6ytycfdeyzrhkxaz5kfc6vn'; // TODO: replace with your actual agent ID
 
 // If using a private agent, set this to true and ensure the backend is running
 // on http://localhost:3001 as implemented in backend/server.js.
@@ -211,11 +207,27 @@ function setConnectedUI(connected) {
   if (micButton) {
     micButton.classList.toggle('active', connected);
     micButton.setAttribute('aria-pressed', String(connected));
+    if (connected) updateMicState('waiting'); else updateMicState('idle');
   }
   if (connBadge) {
     connBadge.classList.remove('ok','warn','err');
     connBadge.classList.add(connected ? 'ok' : 'err');
   }
+}
+
+function updateMicState(state) {
+  if (!micButton) return;
+  const states = ['idle','waiting','listening','speaking'];
+  for (const s of states) micButton.classList.remove(`state-${s}`);
+  micButton.classList.add(`state-${state}`);
+  const mapTitle = {
+    idle: 'Tap to start conversation',
+    waiting: 'Connected… waiting',
+    listening: 'Listening… speak now',
+    speaking: 'Agent speaking… tap to stop'
+  };
+  micButton.title = mapTitle[state] || 'Microphone';
+  micButton.setAttribute('aria-label', micButton.title);
 }
 
 async function getSignedUrl() {
@@ -248,25 +260,27 @@ async function startConversation() {
       onConnect: () => {
         connectionStatus.textContent = 'Connected';
         setConnectedUI(true);
+        updateMicState('waiting');
       },
       onDisconnect: () => {
         connectionStatus.textContent = 'Disconnected';
         setConnectedUI(false);
+        updateMicState('idle');
       },
       onError: (error) => {
         console.error('Error:', error);
       },
       onModeChange: (mode) => {
         currentMode = mode.mode || 'idle';
-        agentStatus.textContent = currentMode;
-        if (modeBadge) {
-          modeBadge.classList.remove('ok','warn','err');
-          if (currentMode === 'speaking') modeBadge.classList.add('warn');
-          else if (currentMode === 'listening') modeBadge.classList.add('ok');
-          else modeBadge.classList.add('warn');
-        }
+        if (currentMode === 'speaking') updateMicState('speaking');
+        else if (currentMode === 'listening') updateMicState('listening');
+        else updateMicState('waiting');
         // Short window where incoming onMessage is treated as user transcripts
         if (currentMode === 'listening') userWindowUntil = Date.now() + 6000; else userWindowUntil = 0;
+        // Attempt to start agent audio capture when the agent begins speaking
+        if (currentMode === 'speaking') {
+          tryStartAgentAudioCapture();
+        }
       },
       onMessage: (msg) => {
         const text = typeof msg === 'string' ? msg : (msg && (msg.text || msg.message || msg.content));
@@ -281,8 +295,12 @@ async function startConversation() {
       },
     });
 
-    // Try to capture agent audio and push to STT in chunks
-    tryStartAgentAudioCapture();
+    // Try to capture agent audio and push to STT in chunks (best-effort)
+    try {
+      tryStartAgentAudioCapture();
+    } catch (e) {
+      console.warn('Agent audio capture not available yet:', e);
+    }
     // Ensure local WS is connected
     connectLocalWS();
   } catch (error) {
@@ -298,7 +316,7 @@ async function stopConversation() {
   stopAgentAudioCapture();
 }
 
-// Mic toggle and mock send
+// Mic toggle only
 if (micButton) {
   micButton.addEventListener('click', async () => {
     if (!convActive) {
@@ -309,28 +327,17 @@ if (micButton) {
     }
   });
 }
-if (sendButton && chatInput) {
-  sendButton.addEventListener('click', () => {
-    const val = chatInput.value.trim();
-    if (!val) return;
-    appendMessage('user', val, 'mock');
-    chatInput.value = '';
-  });
-  chatInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      sendButton.click();
-    }
-  });
-}
 
 // Attempt to resolve agent output audio stream for recording
 function resolveAgentOutputStream() {
   try {
     if (conversation) {
+      // Some SDKs expose direct media streams; if present, prefer them.
       if (typeof conversation.getOutputMediaStream === 'function') {
-        const s = conversation.getOutputMediaStream();
-        if (s) return s;
+        try {
+          const s = conversation.getOutputMediaStream();
+          if (s) return s;
+        } catch (_) {}
       }
       if (conversation.outputStream instanceof MediaStream) {
         return conversation.outputStream;
@@ -351,6 +358,20 @@ function tryStartAgentAudioCapture() {
   const stream = resolveAgentOutputStream();
   if (!stream) {
     console.warn('Agent audio capture unavailable; relying on onMessage text');
+    return;
+  }
+  // Ensure we have at least one audio track before starting the recorder.
+  const audioTracks = typeof stream.getAudioTracks === 'function' ? stream.getAudioTracks() : [];
+  if (!audioTracks || audioTracks.length === 0) {
+    console.warn('No audio tracks on agent stream yet; waiting for track...');
+    try {
+      const onAddTrack = () => {
+        try { stream.removeEventListener('addtrack', onAddTrack); } catch (_) {}
+        // Defer slightly to let track become live
+        setTimeout(() => { try { tryStartAgentAudioCapture(); } catch (_) {} }, 100);
+      };
+      stream.addEventListener && stream.addEventListener('addtrack', onAddTrack);
+    } catch (_) {}
     return;
   }
   const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : (MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/webm');
@@ -377,7 +398,14 @@ function tryStartAgentAudioCapture() {
     }
   };
   mediaRecorder.onerror = (e) => console.error('MediaRecorder error', e);
-  mediaRecorder.start(CHUNK_MS);
+  try {
+    mediaRecorder.start(CHUNK_MS);
+  } catch (e) {
+    console.warn('MediaRecorder.start failed:', e);
+    try { mediaRecorder.stop(); } catch (_) {}
+    mediaRecorder = null;
+    return;
+  }
   recordingActive = true;
 }
 
@@ -404,11 +432,7 @@ async function sttChunk(blob) {
 
 // Initialize status and local WS
 setConnectedUI(false);
-if (modeBadge && agentStatus) {
-  modeBadge.classList.remove('ok','warn','err');
-  modeBadge.classList.add('warn');
-  agentStatus.textContent = 'idle';
-}
+updateMicState('idle');
 connectLocalWS();
 function classifyIncomingMessage(msg) {
   // Try to infer whether this message comes from the user (mic) or agent
