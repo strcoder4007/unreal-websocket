@@ -40,13 +40,18 @@ Notes
 - The frontend imports `@elevenlabs/client` and calls `Conversation.startSession` with either `agentId` or `signedUrl`, mirroring the ElevenLabs quickstart.
 - For production, add error handling and URL refresh logic for expiring signed URLs.
 
-Voice-to-Text forwarding to local WebSocket
-- The frontend attempts two paths to obtain text:
-  - onMessage callback from the Agents SDK (low latency, robust)
-  - Optional audio capture of agent output with MediaRecorder -> POST chunks to `backend` STT -> map to text
-- Complete agent responses (no sentence chunking) are forwarded once per speaking turn to `ws://127.0.0.1:8080` with `lstext^` prefix via a resilient WebSocket client.
+Voice-to-Text streaming to local WebSocket
+- Sources of text:
+  - `onMessage` from the Agents SDK (used for UI display only)
+  - Optional MediaRecorder capture of agent audio -> backend STT -> partial transcripts
+- Robust sentence chunking and queue:
+  - Partial transcripts are accumulated and segmented into sentences with basic abbreviation/decimal handling.
+  - Sentences are queued and streamed to `LOCAL_WS_URL` as `lstext^<sentence>`.
+  - On interruption (`onModeChange` transitions from `speaking` -> `listening`), the queue is canceled and pending sentences are dropped, so Unreal stops receiving new text.
+  - On natural completion (leaving `speaking` to any other mode), the remaining partial is flushed as one final chunk.
 - Configure in `client/script.js`:
-  - `LOCAL_WS_URL` if your local server is different
-  - `CHUNK_MS` controls MediaRecorder chunking; STT chunks are internally accumulated and only the final combined transcript is sent
-  - `MAX_IN_FLIGHT` to cap concurrent STT requests
-- Backend STT route: `POST http://localhost:3001/api/stt-chunk` accepts `audio/webm` (and some other audio mime types) and calls ElevenLabs STT. Requires `ELEVENLABS_API_KEY`.
+  - `LOCAL_WS_URL` for your local WebSocket
+  - `CHUNK_MS` MediaRecorder pacing; lower is lower latency
+  - `MAX_IN_FLIGHT` caps concurrent STT requests
+  - `SEND_STOP_ON_INTERRUPT` and `STOP_CONTROL_MESSAGE` if your Unreal server supports an explicit stop control signal
+- Backend STT route: `POST http://localhost:3001/api/stt-chunk` accepts audio blobs and calls ElevenLabs STT. Requires `ELEVENLABS_API_KEY`.
