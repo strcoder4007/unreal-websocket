@@ -94,13 +94,19 @@ function connectLocalWS() {
   if (localWSConnected || localWSConnecting) return;
   localWSConnecting = true;
   try {
+    console.log(`[WS] Connecting to ${LOCAL_WS_URL}...`);
     localWS = new WebSocket(LOCAL_WS_URL);
     localWS.onopen = () => {
       localWSConnected = true;
       localWSConnecting = false;
       setLocalWsStatus('connected');
+      console.log('[WS] Connected. Flushing queue...');
       while (localWSQueue.length) {
-        try { localWS.send(localWSQueue.shift()); } catch (_) { break; }
+        try {
+          const payload = localWSQueue.shift();
+          localWS.send(payload);
+          console.log('[WS] Flushed queued payload:', payload);
+        } catch (e) { console.warn('[WS] Failed sending queued payload:', e); break; }
       }
       localWSBackoff = 500;
     };
@@ -108,16 +114,19 @@ function connectLocalWS() {
       localWSConnected = false;
       localWSConnecting = false;
       setLocalWsStatus('disconnected');
+      console.warn('[WS] Disconnected. Will retry...', { backoff: localWSBackoff });
       setTimeout(connectLocalWS, localWSBackoff);
       localWSBackoff = Math.min(localWSBackoff * 2, 10000);
     };
     localWS.onerror = () => {
       // handled by onclose
+      console.warn('[WS] Error event.');
     };
   } catch (e) {
     localWSConnected = false;
     localWSConnecting = false;
     setLocalWsStatus('error');
+    console.error('[WS] Connect threw:', e);
     setTimeout(connectLocalWS, localWSBackoff);
     localWSBackoff = Math.min(localWSBackoff * 2, 10000);
   }
@@ -246,7 +255,7 @@ class SentenceQueue {
     console.log(`[Interrupt] Aborting sentence queue (${reason}). Dropped ${dropped} pending; cleared remainder len=${remLen}.`);
     // Optionally signal Unreal to stop
     if (SEND_STOP_ON_INTERRUPT) {
-      try { this.sendFn(STOP_CONTROL_MESSAGE); } catch (_) {}
+      try { _sendLocal(STOP_CONTROL_MESSAGE); } catch (_) {}
     }
   }
 
@@ -263,7 +272,7 @@ class SentenceQueue {
         const now = Date.now();
         if (item !== this.lastSent || now - this.lastSentAt > 2000) {
           console.log(`[Queue] Sending sentence to LOCAL_WS_URL: "${item}"`);
-          this.sendFn(`lstext^${item}`);
+          this.sendFn(item);
           this.lastSent = item;
           this.lastSentAt = now;
         }
@@ -285,8 +294,18 @@ class SentenceQueue {
   }
 }
 
-const sentenceQueue = new SentenceQueue((payload) => {
-  _sendLocal(payload);
+// Track sentences already sent within the current speaking turn to avoid dupes
+let turnSentSet = new Set();
+
+const sentenceQueue = new SentenceQueue((sentence) => {
+  const s = String(sentence || '').trim();
+  if (!s) return;
+  if (turnSentSet.has(s)) {
+    console.log(`[Queue] Skipping duplicate sentence this turn: "${s}"`);
+    return;
+  }
+  turnSentSet.add(s);
+  _sendLocal(`lstext^${s}`);
 });
 
 function _sendLocal(payload) {
@@ -399,6 +418,8 @@ async function startConversation() {
         if (currentMode === 'listening') userWindowUntil = Date.now() + 6000; else userWindowUntil = 0;
         // Attempt to start agent audio capture when the agent begins speaking
         if (currentMode === 'speaking') {
+          // New turn: clear per-turn dedupe
+          turnSentSet.clear();
           tryStartAgentAudioCapture();
         }
         // Handle interruption vs. natural completion
@@ -417,7 +438,11 @@ async function startConversation() {
         if (text) {
           const role = classifyIncomingMessage(msg);
           appendMessage(role, text, 'onMessage');
-          // Do NOT forward full agent messages directly; we stream via STT sentenceQueue.
+          // Feed agent messages into the sentence queue as a fallback (or alongside STT).
+          if (role !== 'user') {
+            console.log(`[AgentMsg] onMessage text received; feeding queue. text="${text}"`);
+            sentenceQueue.pushPartial(text);
+          }
         }
       },
     });
