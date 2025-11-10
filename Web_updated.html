@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<!-- saved from url=(0039)file:///C:/Users/MSI/Downloads/Web.html -->
+<html lang="en"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+  
+  <title>WebSocket File Playback</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    body { margin: 24px; }
+    h2 { margin: 24px 0 8px; font-size: 18px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; margin: 12px 0; align-items: flex-start; }
+    button { padding: 10px 16px; border: 1px solid #ccc; border-radius: 8px; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    textarea { padding: 8px; border: 1px solid #ccc; border-radius: 6px; min-width: 480px; min-height: 80px; resize: vertical; }
+    #status { font-weight: 600; }
+    #log { white-space: pre-wrap; background: #fafafa; border: 1px solid #eee; padding: 12px; border-radius: 8px; height: 220px; overflow: auto; }
+    .ok { color: #1a7f37; }
+    .warn { color: #a15c00; }
+    .err { color: #b3261e; }
+    .card { border: 1px solid #eee; border-radius: 12px; padding: 12px; margin-bottom: 20px; }
+  </style>
+</head>
+<body>
+  <h1>WebSocket File Playback</h1>
+
+  <!-- Server Selection -->
+  <div class="card">
+    <h2>Server Selection</h2>
+    <div class="row">
+      <label><b>Server URL:</b></label>
+      <input id="serverUrl" type="text" value="ws://127.0.0.1:8080/" style="min-width:320px; padding:8px; border:1px solid #ccc; border-radius:6px;">
+      <button id="btnConnect">Connect</button>
+    </div>
+    <div>Status: <span id="status" class="warn">Disconnected</span></div>
+  </div>
+
+  <!-- File Playback -->
+  <div class="card">
+    <h2>File Playback</h2>
+
+    <div class="row">
+      <textarea id="para1">MetaHumans are now being adopted for enterprise and research use cases. They are used as digital brand ambassadors, AI-driven virtual assistants, and in educational or healthcare simulations. When combined with AI speech synthesis, computer vision, and real-time rendering, MetaHumans form the foundation of next-generation “digital humans” capable of natural conversation and emotional engagement. This fusion of artistry and technology is transforming how humans interact with virtual entities across immersive experiences.</textarea>
+      <button id="send1" disabled="">Send 1</button>
+    </div>
+
+    <div class="row">
+      <textarea id="para2">MetaHumans are highly realistic digital humans created using Epic Games’ MetaHuman framework, a powerful toolset integrated with Unreal Engine. They provide artists and developers with an advanced way to create lifelike human characters quickly, complete with detailed facial features, skin textures, and realistic hair. Each MetaHuman is fully rigged for facial animation, body movement, and speech synchronization, allowing for natural expressions and gestures that were once achievable only through complex modeling pipelines..</textarea>
+      <button id="send2" disabled="">Send 2</button>
+    </div>
+
+    <div class="row">
+      <textarea id="para3">Once a MetaHuman is finalized, it can be downloaded into Unreal Engine with optimized rigs ready for animation or motion capture input.</textarea>
+      <button id="send3" disabled="">Send 3</button>
+    </div>
+
+    <div class="row">
+      <button id="btnPlay" disabled="">Play</button>
+      <button id="btnPause" disabled="">Pause</button>
+    </div>
+  </div>
+
+  <h2>Log</h2>
+  <div id="log" class="card" aria-live="polite"></div>
+
+  <script>
+    const elStatus = document.getElementById("status");
+    const elLog = document.getElementById("log");
+    const btnConnect = document.getElementById("btnConnect");
+    const inputUrl = document.getElementById("serverUrl");
+
+    const btnSend1 = document.getElementById("send1");
+    const btnSend2 = document.getElementById("send2");
+    const btnSend3 = document.getElementById("send3");
+    const btnPlay  = document.getElementById("btnPlay");
+    const btnPause = document.getElementById("btnPause");
+
+    const para1 = document.getElementById("para1");
+    const para2 = document.getElementById("para2");
+    const para3 = document.getElementById("para3");
+
+    let socket = null;
+
+    function setButtonsEnabled(connected) {
+      [btnSend1, btnSend2, btnSend3, btnPlay, btnPause].forEach(btn => btn.disabled = !connected);
+    }
+
+    function setStatus(text, cls) {
+      elStatus.textContent = text;
+      elStatus.className = cls || "";
+    }
+
+    function log(line, cls) {
+      const stamp = new Date().toLocaleTimeString();
+      const entry = document.createElement("div");
+      entry.className = cls || "";
+      entry.textContent = `[${stamp}] ${line}`;
+      elLog.appendChild(entry);
+      elLog.scrollTop = elLog.scrollHeight;
+    }
+
+    function connect(url) {
+      if (!url) {
+        log("Please enter a server URL.", "err");
+        return;
+      }
+
+      if (socket) {
+        try { socket.close(); log("Closing existing connection…", "warn"); } catch {}
+      }
+
+      try {
+        socket = new WebSocket(url);
+      } catch (err) {
+        log(`Failed to create WebSocket: ${err}`, "err");
+        return;
+      }
+
+      setStatus("Connecting…", "warn");
+      log(`Connecting to ${url} …`);
+
+      socket.addEventListener("open", () => {
+        setStatus("Connected", "ok");
+        setButtonsEnabled(true);
+        log("WebSocket connection established.", "ok");
+      });
+
+      socket.addEventListener("message", evt => log(`← ${evt.data}`));
+      socket.addEventListener("error", () => log("WebSocket error occurred.", "err"));
+      socket.addEventListener("close", evt => {
+        setStatus("Disconnected", "warn");
+        setButtonsEnabled(false);
+        log(`Connection closed (code ${evt.code}).`, "warn");
+      });
+    }
+
+    function sendMessage(msg) {
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        log("Cannot send: socket not connected.", "err");
+        return;
+      }
+      socket.send(msg);
+      log(`→ ${msg}`);
+    }
+
+    btnConnect.addEventListener("click", () => connect(inputUrl.value.trim()));
+
+    btnSend1.addEventListener("click", () => sendMessage("lstext^" + para1.value.trim()));
+    btnSend2.addEventListener("click", () => sendMessage("lstext^" + para2.value.trim()));
+    btnSend3.addEventListener("click", () => sendMessage("lstext^" + para3.value.trim()));
+
+    btnPlay.addEventListener("click", () => sendMessage("action^play"));
+    btnPause.addEventListener("click", () => sendMessage("action^pause"));
+  </script>
+
+
+</body></html>

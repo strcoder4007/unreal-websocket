@@ -31,8 +31,9 @@ let lastForwardedText = '';
 let lastForwardedAt = 0;
 
 // Optional: if your Unreal avatar supports a stop command, set this and define the message.
-const SEND_STOP_ON_INTERRUPT = false;
-const STOP_CONTROL_MESSAGE = 'lsstop^';
+// Enable and map to Unreal's pause control so interruptions stop output immediately.
+const SEND_STOP_ON_INTERRUPT = true;
+const STOP_CONTROL_MESSAGE = 'action^pause';
 
 // Messages state
 let messages = [];
@@ -41,6 +42,11 @@ let lastAppendedText = '';
 let lastAppendedAt = 0;
 let currentMode = 'idle';
 let userWindowUntil = 0;
+// When true, drop any outgoing text to Unreal and send a pause signal
+let unrealPaused = false;
+let lastPauseSentAt = 0;
+let savedVolume = 1;
+let agentTurnBuffer = '';
 
 function tsShort(d = new Date()) {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -132,182 +138,6 @@ function connectLocalWS() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Outbound sentence queue with robust segmentation + interruption cancelation
-// ---------------------------------------------------------------------------
-
-// Basic abbreviation list to avoid splitting on common dotted words.
-const ABBREV = new Set([
-  'mr','mrs','ms','dr','prof','sr','jr','st','rd','ave','blvd','apt','no','fig','al',
-  'etc','e.g','i.e','vs','approx','est','dept','inc','ltd','co','u.s','u.k','usa','uk',
-  'jan','feb','mar','apr','jun','jul','aug','sep','sept','oct','nov','dec'
-]);
-
-function isLetter(ch){ return /[A-Za-z]/.test(ch); }
-function isDigit(ch){ return /[0-9]/.test(ch); }
-
-// Extract as many complete sentences as possible, leaving remainder for next chunk.
-function extractSentences(buffer) {
-  const sentences = [];
-  const s = String(buffer || '');
-  const n = s.length;
-  let i = 0;
-  let start = 0;
-
-  const pushSentence = (endIdx) => {
-    let end = endIdx;
-    // include trailing quotes/parens
-    while (end < n && /[)\]\"'”’»]/.test(s[end])) end++;
-    // include following space
-    let sentence = s.slice(start, end).trim();
-    if (sentence) sentences.push(sentence);
-    // advance start to next non-space
-    start = end;
-    while (start < n && /\s/.test(s[start])) start++;
-  };
-
-  while (i < n) {
-    const ch = s[i];
-    if (ch === '.' || ch === '!' || ch === '?') {
-      // ellipses: treat as boundary at the last dot
-      if (ch === '.' && i + 2 < n && s[i + 1] === '.' && s[i + 2] === '.') {
-        i += 2; // move to the 3rd dot
-        pushSentence(i + 1);
-      } else if (ch === '.') {
-        // decimal number: 3.14
-        const prev = i > 0 ? s[i - 1] : '';
-        const next = i + 1 < n ? s[i + 1] : '';
-        if (isDigit(prev) && isDigit(next)) {
-          // not a boundary
-        } else {
-          // check abbreviation just before dot
-          let k = i - 1;
-          while (k >= 0 && isLetter(s[k])) k--;
-          const word = s.slice(k + 1, i).toLowerCase();
-          if (!ABBREV.has(word)) {
-            pushSentence(i + 1);
-          }
-        }
-      } else {
-        // ! or ? are boundaries
-        pushSentence(i + 1);
-      }
-    } else if (ch === '\n') {
-      // treat double newlines or line followed by uppercase start as boundary
-      const prev = i > 0 ? s[i - 1] : '';
-      const next = i + 1 < n ? s[i + 1] : '';
-      if (prev === '\n' || /[A-Z"'“(]/.test(next)) {
-        pushSentence(i);
-      }
-    }
-    i++;
-  }
-  const remainder = s.slice(start);
-  return { sentences, remainder };
-}
-
-class SentenceQueue {
-  constructor(sendFn) {
-    this.sendFn = sendFn;
-    this.pending = [];
-    this.buffer = '';
-    this.gen = 0; // increments on abort
-    this.draining = false;
-    this.lastSent = '';
-    this.lastSentAt = 0;
-    this.SEND_DELAY_MS = 50; // throttle a touch to avoid flooding
-  }
-
-  pushPartial(text) {
-    if (!text) return;
-    this.buffer = this.buffer ? `${this.buffer} ${String(text)}` : String(text);
-    const { sentences, remainder } = extractSentences(this.buffer);
-    if (sentences.length) {
-      console.log(`[Segmentation] Extracted ${sentences.length} sentence(s):`, sentences);
-      this.pending.push(...sentences);
-    } else {
-      const len = String(remainder || '').trim().length;
-      console.log(`[Segmentation] No complete sentence yet; remainder len=${len}`);
-    }
-    this.buffer = remainder;
-    this.#drainSoon();
-  }
-
-  flushRemainder() {
-    const rem = String(this.buffer || '').trim();
-    if (rem) {
-      console.log(`[Segmentation] Flushing remainder as final sentence: "${rem}"`);
-      this.pending.push(rem);
-    } else {
-      console.log('[Segmentation] No remainder to flush.');
-    }
-    this.buffer = '';
-    this.#drainSoon();
-  }
-
-  abort(reason = 'interrupted') {
-    // Increment generation to cancel drainers, drop anything queued.
-    const dropped = this.pending.length;
-    const remLen = String(this.buffer || '').trim().length;
-    this.gen++;
-    this.pending.length = 0;
-    this.buffer = '';
-    console.log(`[Interrupt] Aborting sentence queue (${reason}). Dropped ${dropped} pending; cleared remainder len=${remLen}.`);
-    // Optionally signal Unreal to stop
-    if (SEND_STOP_ON_INTERRUPT) {
-      try { _sendLocal(STOP_CONTROL_MESSAGE); } catch (_) {}
-    }
-  }
-
-  async #drain(genAtStart) {
-    const myGen = this.gen;
-    if (genAtStart !== undefined && genAtStart !== myGen) return;
-    if (this.draining) return;
-    this.draining = true;
-    try {
-      while (this.pending.length && myGen === this.gen) {
-        const item = String(this.pending.shift()).trim();
-        if (!item) continue;
-        // lightweight dedupe
-        const now = Date.now();
-        if (item !== this.lastSent || now - this.lastSentAt > 2000) {
-          console.log(`[Queue] Sending sentence to LOCAL_WS_URL: "${item}"`);
-          this.sendFn(item);
-          this.lastSent = item;
-          this.lastSentAt = now;
-        }
-        if (this.SEND_DELAY_MS > 0) await new Promise(r => setTimeout(r, this.SEND_DELAY_MS));
-      }
-    } finally {
-      this.draining = false;
-      // If more arrived while draining, loop again
-      if (this.pending.length && this.gen === myGen) {
-        // Schedule microtask to avoid deep recursion
-        queueMicrotask(() => this.#drain(myGen));
-      }
-    }
-  }
-
-  #drainSoon() {
-    // Kick a drain pass in a microtask
-    queueMicrotask(() => this.#drain());
-  }
-}
-
-// Track sentences already sent within the current speaking turn to avoid dupes
-let turnSentSet = new Set();
-
-const sentenceQueue = new SentenceQueue((sentence) => {
-  const s = String(sentence || '').trim();
-  if (!s) return;
-  if (turnSentSet.has(s)) {
-    console.log(`[Queue] Skipping duplicate sentence this turn: "${s}"`);
-    return;
-  }
-  turnSentSet.add(s);
-  _sendLocal(`lstext^${s}`);
-});
-
 function _sendLocal(payload) {
   if (localWSConnected && localWS && localWS.readyState === WebSocket.OPEN) {
     try { localWS.send(payload); } catch (_) {}
@@ -319,16 +149,86 @@ function _sendLocal(payload) {
   }
 }
 
+function sendPauseToUnreal() {
+  const now = Date.now();
+  if (now - lastPauseSentAt < 150) return; // guard against rapid duplicates
+  lastPauseSentAt = now;
+  try { _sendLocal('action^pause'); } catch (_) {}
+}
+
+function clearLocalTextQueue() {
+  // Remove any queued lstext^ payloads that haven't been flushed yet
+  if (Array.isArray(localWSQueue) && localWSQueue.length) {
+    const before = localWSQueue.length;
+    localWSQueue = localWSQueue.filter((p) => {
+      try { return !(typeof p === 'string' && p.startsWith('lstext^')); }
+      catch { return true; }
+    });
+    const after = localWSQueue.length;
+    if (before !== after) console.log(`[WS] Cleared ${before - after} queued lstext^ payload(s) on interrupt.`);
+  }
+}
+
 function forwardTextToLocalWS(text) {
   if (!text) return;
   const s = String(text).trim();
   if (!s) return;
+  if (unrealPaused) {
+    console.log(`[WS-direct] Paused; dropping full text: "${s}"`);
+    return;
+  }
   const now = Date.now();
   if (s === lastForwardedText && now - lastForwardedAt < 2000) return; // basic dedupe
   lastForwardedText = s;
   lastForwardedAt = now;
   console.log(`[WS-direct] Sending full text to LOCAL_WS_URL: "${s}"`);
   _sendLocal(`lstext^${s}`);
+}
+
+function resetAgentTurnState() {
+  agentTurnBuffer = '';
+  lastForwardedText = '';
+  lastForwardedAt = 0;
+}
+
+function sendAgentDelta(text, source = 'agent') {
+  if (unrealPaused) {
+    console.log(`[AgentOut] Paused; dropping ${source} chunk.`);
+    return;
+  }
+  let raw = typeof text === 'string' ? text : (text == null ? '' : String(text));
+  if (!raw) return;
+  raw = raw.trim();
+  if (!raw) return;
+
+  if (agentTurnBuffer && raw === agentTurnBuffer) {
+    return; // nothing new
+  }
+
+  let chunk = raw;
+  if (agentTurnBuffer && raw.startsWith(agentTurnBuffer)) {
+    chunk = raw.slice(agentTurnBuffer.length).trim();
+    if (!chunk) {
+      agentTurnBuffer = raw;
+      return;
+    }
+  } else if (agentTurnBuffer && agentTurnBuffer.length > raw.length && agentTurnBuffer.startsWith(raw)) {
+    // Agent text shrank (likely correction). Reset so we resend the new content.
+    resetAgentTurnState();
+    chunk = raw;
+  }
+
+  agentTurnBuffer = raw;
+  forwardTextToLocalWS(chunk);
+}
+
+function haltAgentStreaming(reason = 'interrupted') {
+  console.log(`[Interrupt] Halting agent output (${reason}).`);
+  resetAgentTurnState();
+  clearLocalTextQueue();
+  if (SEND_STOP_ON_INTERRUPT) {
+    sendPauseToUnreal();
+  }
 }
 
 let conversation;
@@ -411,7 +311,12 @@ async function startConversation() {
         const prevMode = currentMode;
         currentMode = mode.mode || 'idle';
         console.log(`[Mode] ${prevMode} -> ${currentMode}`);
-        if (currentMode === 'speaking') updateMicState('speaking');
+        if (currentMode === 'speaking') {
+          updateMicState('speaking');
+          unrealPaused = false;
+          // restore volume in case we muted on interrupt
+          try { if (conversation && typeof conversation.setVolume === 'function') conversation.setVolume({ volume: savedVolume || 1 }); } catch (_) {}
+        }
         else if (currentMode === 'listening') updateMicState('listening');
         else updateMicState('waiting');
         // Short window where incoming onMessage is treated as user transcripts
@@ -419,29 +324,63 @@ async function startConversation() {
         // Attempt to start agent audio capture when the agent begins speaking
         if (currentMode === 'speaking') {
           // New turn: clear per-turn dedupe
-          turnSentSet.clear();
+          resetAgentTurnState();
           tryStartAgentAudioCapture();
         }
         // Handle interruption vs. natural completion
         if (prevMode === 'speaking' && currentMode === 'listening') {
-          // Interrupted mid-utterance: cancel queued sentences and ignore remainder
-          console.log('[Interrupt] Detected speaking -> listening during agent response. Canceling queued sentences.');
-          sentenceQueue.abort('interrupted');
+          // Interrupted mid-utterance: halt any further output
+          console.log('[Interrupt] Detected speaking -> listening during agent response. Halting output.');
+          unrealPaused = true;
+          haltAgentStreaming('mode-change');
+          // mute agent output immediately
+          try {
+            if (conversation && typeof conversation.setVolume === 'function') {
+              savedVolume = 1; // default
+              conversation.setVolume({ volume: 0 });
+            }
+          } catch (_) {}
+          try { if (agentAudioEl && typeof agentAudioEl.pause === 'function') agentAudioEl.pause(); } catch (_) {}
+          try { stopAgentAudioCapture(); } catch (_) {}
         } else if (prevMode === 'speaking' && currentMode !== 'speaking') {
-          // Natural end of speaking turn: flush any remainder as final chunk
-          console.log('[Turn] Agent finished speaking. Flushing remainder.');
-          sentenceQueue.flushRemainder();
+          // Natural end of speaking turn
+          console.log('[Turn] Agent finished speaking.');
         }
+      },
+      // Official ElevenLabs interruption event: log only the event_id
+      // and notify local Unreal bridge to pause
+      onInterruption: (ev) => {
+        try {
+          console.log('[11labs/interruption]', { event_id: ev && ev.event_id });
+        } catch (_) {
+          console.log('[11labs/interruption]', ev && ev.event_id);
+        }
+        // Pause Unreal and stop any further text from being streamed this turn
+        unrealPaused = true;
+        haltAgentStreaming('interruption');
+        // mute agent output immediately
+        try {
+          if (conversation && typeof conversation.setVolume === 'function') {
+            savedVolume = 1; // default
+            conversation.setVolume({ volume: 0 });
+          }
+        } catch (_) {}
+        try { if (agentAudioEl && typeof agentAudioEl.pause === 'function') agentAudioEl.pause(); } catch (_) {}
+        try { stopAgentAudioCapture(); } catch (_) {}
       },
       onMessage: (msg) => {
         const text = typeof msg === 'string' ? msg : (msg && (msg.text || msg.message || msg.content));
         if (text) {
           const role = classifyIncomingMessage(msg);
           appendMessage(role, text, 'onMessage');
-          // Feed agent messages into the sentence queue as a fallback (or alongside STT).
+          // Feed agent messages into the Unreal bridge as a fallback (or alongside STT).
           if (role !== 'user') {
-            console.log(`[AgentMsg] onMessage text received; feeding queue. text="${text}"`);
-            sentenceQueue.pushPartial(text);
+            if (unrealPaused) {
+              console.log('[AgentMsg] Paused; dropping onMessage text.');
+            } else {
+              console.log(`[AgentMsg] onMessage text received; processing. text="${text}"`);
+              sendAgentDelta(text, 'message');
+            }
           }
         }
       },
@@ -466,6 +405,7 @@ async function stopConversation() {
     conversation = null;
   }
   stopAgentAudioCapture();
+  unrealPaused = false;
 }
 
 // Mic toggle only
@@ -541,9 +481,13 @@ function tryStartAgentAudioCapture() {
       const text = await sttChunk(ev.data);
       if (text) {
         console.log(`[STT] Partial transcript: "${text}"`);
-        // Feed partial transcription into sentence queue for chunking & sending.
-        sentenceQueue.pushPartial(text);
-        appendMessage('agent', text, 'stt');
+        // Feed partial transcription into the Unreal bridge.
+        if (unrealPaused) {
+          console.log('[STT] Paused; dropping partial transcript.');
+        } else {
+          sendAgentDelta(text, 'stt');
+          appendMessage('agent', text, 'stt');
+        }
       }
     } catch (err) {
       console.error('STT chunk failed:', err);
@@ -567,8 +511,7 @@ function stopAgentAudioCapture() {
   try { if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop(); } catch (_) {}
   mediaRecorder = null;
   recordingActive = false;
-  // Flush any remaining STT that wasn't sent yet
-  sentenceQueue.flushRemainder();
+  resetAgentTurnState();
 }
 
 async function sttChunk(blob) {
@@ -586,8 +529,6 @@ async function sttChunk(blob) {
   return data && (data.text || data.transcript || data.transcription || data.result);
 }
 
-// sentenceQueue handles flushing; no-op retained for compatibility
-function flushSttTurnBuffer() {}
 
 // Initialize status and local WS
 setConnectedUI(false);

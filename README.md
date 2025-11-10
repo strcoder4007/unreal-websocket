@@ -44,11 +44,10 @@ Voice-to-Text streaming to local WebSocket
 - Sources of text:
   - `onMessage` from the Agents SDK (used for UI display only)
   - Optional MediaRecorder capture of agent audio -> backend STT -> partial transcripts
-- Robust sentence chunking and queue:
-  - Partial transcripts are accumulated and segmented into sentences with basic abbreviation/decimal handling.
-  - Sentences are queued and streamed to `LOCAL_WS_URL` as `lstext^<sentence>`.
-  - On interruption (`onModeChange` transitions from `speaking` -> `listening`), the queue is canceled and pending sentences are dropped, so Unreal stops receiving new text.
-  - On natural completion (leaving `speaking` to any other mode), the remaining partial is flushed as one final chunk.
+- Incremental agent text forwarding:
+  - Agent text from `onMessage` and optional STT partials is diffed and any new portion is streamed to `LOCAL_WS_URL` as `lstext^<chunk>`.
+  - Interruptions emit `action^pause`, mute audio, and clear any pending text so Unreal stops immediately.
+  - New speaking turns reset the diff tracker so streaming restarts cleanly after an interruption.
 - Configure in `client/script.js`:
   - `LOCAL_WS_URL` for your local WebSocket
   - `CHUNK_MS` MediaRecorder pacing; lower is lower latency
