@@ -9,7 +9,6 @@ Coding style and structure
 
 Project layout
 - `client/` — Vite frontend. Entry: `client/index.html`.
-- `backend/` — optional Express server for signed URLs.
 - `README.md` — quickstart instructions for running and developing.
 
 Contributing in this workspace
@@ -19,7 +18,4 @@ Contributing in this workspace
 
 Testing and validation
 - Keep frontend self-contained and easy to open locally.
-- If a backend is added, document env vars in `.env.example`.
 
-Notes
-- This repo mirrors the ElevenLabs Vite quickstart structure with a `client/` root for Vite and optional `backend/` for private-agent auth.
