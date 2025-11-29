@@ -22,13 +22,14 @@ const SIGNED_URL_FLOW = false;
 
 // Local WebSocket forwarder (sends lstext^<text> to ws://127.0.0.1:8080)
 const LOCAL_WS_URL = 'ws://127.0.0.1:8080';
+const AUDIO_SAVE_ENDPOINT = 'http://localhost:3001/api/save-agent-audio'; // backend endpoint that persists agent audio chunks
 let localWS = null;
 let localWSConnected = false;
 let localWSQueue = [];
 let localWSBackoff = 500; // ms
 let localWSConnecting = false;
-let lastForwardedText = '';
-let lastForwardedAt = 0;
+let lastForwardedPath = '';
+let lastForwardedPathAt = 0;
 
 // Optional: if your Unreal avatar supports a stop command, set this and define the message.
 // Enable and map to Unreal's pause control so interruptions stop output immediately.
@@ -46,7 +47,14 @@ let userWindowUntil = 0;
 let unrealPaused = false;
 let lastPauseSentAt = 0;
 let savedVolume = 1;
-let agentTurnBuffer = '';
+const audioChunkQueue = []; // preserves audio chunk ordering between capture, disk write, and websocket forwarding
+let audioQueueDraining = false;
+let audioChunkSeq = 0;
+let conversationOutputFormat = 'pcm';
+let conversationOutputSampleRate = 44100;
+const DEFAULT_SAMPLE_RATE = 44100;
+const DEFAULT_CHANNELS = 1;
+const ULAW_DECODE_TABLE = [0,132,396,924,1980,4092,8316,16764];
 
 function tsShort(d = new Date()) {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -157,7 +165,7 @@ function sendPauseToUnreal() {
 }
 
 function clearLocalTextQueue() {
-  // Remove any queued lstext^ payloads that haven't been flushed yet
+  // Remove any queued lstext^ payloads (now carrying file paths) that haven't been flushed yet
   if (Array.isArray(localWSQueue) && localWSQueue.length) {
     const before = localWSQueue.length;
     localWSQueue = localWSQueue.filter((p) => {
@@ -169,62 +177,202 @@ function clearLocalTextQueue() {
   }
 }
 
-function forwardTextToLocalWS(text) {
-  if (!text) return;
-  const s = String(text).trim();
-  if (!s) return;
+function forwardAudioPathToLocalWS(filepath) {
+  if (!filepath) return;
+  const safePath = String(filepath).trim();
+  if (!safePath) return;
   if (unrealPaused) {
-    console.log(`[WS-direct] Paused; dropping full text: "${s}"`);
+    console.log(`[WS-direct] Paused; dropping audio path: "${safePath}"`);
     return;
   }
   const now = Date.now();
-  if (s === lastForwardedText && now - lastForwardedAt < 2000) return; // basic dedupe
-  lastForwardedText = s;
-  lastForwardedAt = now;
-  console.log(`[WS-direct] Sending full text to LOCAL_WS_URL: "${s}"`);
-  _sendLocal(`lstext^${s}`);
+  if (safePath === lastForwardedPath && now - lastForwardedPathAt < 1000) return; // basic dedupe
+  lastForwardedPath = safePath;
+  lastForwardedPathAt = now;
+  console.log(`[WS-direct] Sending audio path to LOCAL_WS_URL: "${safePath}"`);
+  _sendLocal(`lstext^${safePath}`);
 }
 
-function resetAgentTurnState() {
-  agentTurnBuffer = '';
-  lastForwardedText = '';
-  lastForwardedAt = 0;
+function clearPendingAudioChunks(reason = 'reset') {
+  if (!audioChunkQueue.length) return;
+  console.log(`[AudioQueue] Cleared ${audioChunkQueue.length} pending chunk(s) (${reason}).`);
+  audioChunkQueue.length = 0;
 }
 
-function sendAgentDelta(text, source = 'agent') {
+function resetAgentTurnState(reason = 'reset') {
+  lastForwardedPath = '';
+  lastForwardedPathAt = 0;
+  if (reason !== 'new-turn') {
+    clearPendingAudioChunks(reason);
+  }
+}
+
+function enqueueAgentAudioChunk(blob) {
+  if (!blob || typeof blob.size === 'number' && blob.size === 0) return;
+  audioChunkQueue.push({ blob, seq: ++audioChunkSeq });
+  drainAudioChunkQueue().catch((err) => console.error('[AudioQueue] Drain failed:', err));
+}
+
+async function drainAudioChunkQueue() {
+  if (audioQueueDraining) return;
+  audioQueueDraining = true;
+  try {
+    while (audioChunkQueue.length) {
+      if (unrealPaused) {
+        if (audioChunkQueue.length) {
+          console.log(`[AudioQueue] Paused; dropping ${audioChunkQueue.length} pending chunk(s).`);
+          audioChunkQueue.length = 0;
+        }
+        break;
+      }
+      const { blob, seq } = audioChunkQueue.shift();
+      try {
+        const saved = await saveAgentAudioChunk(blob, seq);
+        if (!saved || !saved.filepath) continue;
+        if (unrealPaused) {
+          console.log(`[AudioQueue] Paused after saving chunk ${seq}; not forwarding path.`);
+          continue;
+        }
+        forwardAudioPathToLocalWS(saved.filepath);
+      } catch (err) {
+        console.error(`[AudioQueue] Failed to persist chunk ${seq}:`, err);
+      }
+    }
+  } finally {
+    audioQueueDraining = false;
+  }
+}
+
+async function saveAgentAudioChunk(blob, seq) {
+  const contentType = blob.type || 'audio/webm';
+  const res = await fetch(AUDIO_SAVE_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': contentType },
+    body: blob,
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`Save audio HTTP ${res.status}: ${txt}`);
+  }
+  const data = await res.json();
+  const displayPath = data.relativePath || data.filepath || '(unknown path)';
+  console.log(`[AudioQueue] Saved chunk ${seq} -> ${displayPath}`);
+  return data;
+}
+
+function updateConversationOutputFormat(source = 'unknown') {
+  try {
+    if (conversation && conversation.connection && conversation.connection.outputFormat) {
+      const fmt = conversation.connection.outputFormat;
+      if (fmt && fmt.format) conversationOutputFormat = fmt.format;
+      if (fmt && fmt.sampleRate) conversationOutputSampleRate = fmt.sampleRate;
+    }
+  } catch (err) {
+    console.warn(`[AudioQueue] Failed to read output format from ${source}:`, err);
+  }
+}
+
+function base64ToUint8Array(base64) {
+  const binary = atob(base64);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function bytesToPCM16LE(uint8) {
+  const len = Math.floor(uint8.byteLength / 2);
+  const view = new DataView(uint8.buffer, uint8.byteOffset, uint8.byteLength);
+  const pcm = new Int16Array(len);
+  for (let i = 0; i < len; i++) {
+    pcm[i] = view.getInt16(i * 2, true);
+  }
+  return pcm;
+}
+
+function decodeUlawSample(sample) {
+  let mu = ~sample & 0xff;
+  const sign = mu & 0x80;
+  mu &= 0x7f;
+  const exponent = (mu >> 4) & 0x07;
+  const mantissa = mu & 0x0f;
+  let value = ULAW_DECODE_TABLE[exponent] + (mantissa << (exponent + 3));
+  if (sign) value = -value;
+  return value;
+}
+
+function ulawToPCM16(uint8) {
+  const pcm = new Int16Array(uint8.length);
+  for (let i = 0; i < uint8.length; i++) {
+    pcm[i] = decodeUlawSample(uint8[i]);
+  }
+  return pcm;
+}
+
+function pcm16ToWavBlob(pcmSamples, sampleRate = DEFAULT_SAMPLE_RATE, channels = DEFAULT_CHANNELS) {
+  const bytes = pcmSamples.length * 2;
+  const buffer = new ArrayBuffer(44 + bytes);
+  const view = new DataView(buffer);
+  const writeString = (offset, str) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+  const blockAlign = channels * 2;
+  const byteRate = sampleRate * blockAlign;
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + bytes, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true); // subchunk size
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, channels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, 16, true); // bits per sample
+  writeString(36, 'data');
+  view.setUint32(40, bytes, true);
+
+  let offset = 44;
+  for (let i = 0; i < pcmSamples.length; i++, offset += 2) {
+    view.setInt16(offset, pcmSamples[i], true);
+  }
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+function handleAgentAudioChunk(audioBase64) {
+  if (!audioBase64) return;
   if (unrealPaused) {
-    console.log(`[AgentOut] Paused; dropping ${source} chunk.`);
+    console.log('[AudioQueue] Paused; ignoring incoming audio chunk.');
     return;
   }
-  let raw = typeof text === 'string' ? text : (text == null ? '' : String(text));
-  if (!raw) return;
-  raw = raw.trim();
-  if (!raw) return;
-
-  if (agentTurnBuffer && raw === agentTurnBuffer) {
-    return; // nothing new
-  }
-
-  let chunk = raw;
-  if (agentTurnBuffer && raw.startsWith(agentTurnBuffer)) {
-    chunk = raw.slice(agentTurnBuffer.length).trim();
-    if (!chunk) {
-      agentTurnBuffer = raw;
-      return;
+  try {
+    updateConversationOutputFormat('audio-chunk');
+    const bytes = base64ToUint8Array(audioBase64);
+    if (!bytes || !bytes.length) return;
+    const fmt = (conversationOutputFormat || 'pcm').toLowerCase();
+    const sampleRate = conversationOutputSampleRate || DEFAULT_SAMPLE_RATE;
+    let pcmSamples;
+    if (fmt === 'ulaw') {
+      pcmSamples = ulawToPCM16(bytes);
+    } else {
+      pcmSamples = bytesToPCM16LE(bytes);
     }
-  } else if (agentTurnBuffer && agentTurnBuffer.length > raw.length && agentTurnBuffer.startsWith(raw)) {
-    // Agent text shrank (likely correction). Reset so we resend the new content.
-    resetAgentTurnState();
-    chunk = raw;
+    if (!pcmSamples || !pcmSamples.length) return;
+    const wavBlob = pcm16ToWavBlob(pcmSamples, sampleRate);
+    enqueueAgentAudioChunk(wavBlob);
+  } catch (err) {
+    console.error('[AudioQueue] Failed to convert audio chunk:', err);
   }
-
-  agentTurnBuffer = raw;
-  forwardTextToLocalWS(chunk);
 }
 
 function haltAgentStreaming(reason = 'interrupted') {
   console.log(`[Interrupt] Halting agent output (${reason}).`);
-  resetAgentTurnState();
+  resetAgentTurnState(reason);
   clearLocalTextQueue();
   if (SEND_STOP_ON_INTERRUPT) {
     sendPauseToUnreal();
@@ -232,11 +380,6 @@ function haltAgentStreaming(reason = 'interrupted') {
 }
 
 let conversation;
-let mediaRecorder;
-let recordingActive = false;
-let sttInFlight = 0;
-const MAX_IN_FLIGHT = 2;
-const CHUNK_MS = 4000; // tune latency vs accuracy
 let convActive = false;
 
 function setConnectedUI(connected) {
@@ -298,6 +441,7 @@ async function startConversation() {
         connectionStatus.textContent = 'Connected';
         setConnectedUI(true);
         updateMicState('waiting');
+        updateConversationOutputFormat('connect');
       },
       onDisconnect: () => {
         connectionStatus.textContent = 'Disconnected';
@@ -314,6 +458,7 @@ async function startConversation() {
         if (currentMode === 'speaking') {
           updateMicState('speaking');
           unrealPaused = false;
+          updateConversationOutputFormat('mode-change');
           // restore volume in case we muted on interrupt
           try { if (conversation && typeof conversation.setVolume === 'function') conversation.setVolume({ volume: savedVolume || 1 }); } catch (_) {}
         }
@@ -324,8 +469,7 @@ async function startConversation() {
         // Attempt to start agent audio capture when the agent begins speaking
         if (currentMode === 'speaking') {
           // New turn: clear per-turn dedupe
-          resetAgentTurnState();
-          tryStartAgentAudioCapture();
+          resetAgentTurnState('new-turn');
         }
         // Handle interruption vs. natural completion
         if (prevMode === 'speaking' && currentMode === 'listening') {
@@ -341,7 +485,6 @@ async function startConversation() {
             }
           } catch (_) {}
           try { if (agentAudioEl && typeof agentAudioEl.pause === 'function') agentAudioEl.pause(); } catch (_) {}
-          try { stopAgentAudioCapture(); } catch (_) {}
         } else if (prevMode === 'speaking' && currentMode !== 'speaking') {
           // Natural end of speaking turn
           console.log('[Turn] Agent finished speaking.');
@@ -366,7 +509,6 @@ async function startConversation() {
           }
         } catch (_) {}
         try { if (agentAudioEl && typeof agentAudioEl.pause === 'function') agentAudioEl.pause(); } catch (_) {}
-        try { stopAgentAudioCapture(); } catch (_) {}
       },
       onMessage: (msg) => {
         const text = typeof msg === 'string' ? msg : (msg && (msg.text || msg.message || msg.content));
@@ -376,22 +518,18 @@ async function startConversation() {
           // Feed agent messages into the Unreal bridge as a fallback (or alongside STT).
           if (role !== 'user') {
             if (unrealPaused) {
-              console.log('[AgentMsg] Paused; dropping onMessage text.');
+              console.log('[AgentMsg] Paused; ignoring onMessage text.');
             } else {
-              console.log(`[AgentMsg] onMessage text received; processing. text="${text}"`);
-              sendAgentDelta(text, 'message');
+              console.log(`[AgentMsg] onMessage text received (UI only). text="${text}"`);
             }
           }
         }
       },
+      onAudio: (audioBase64) => {
+        handleAgentAudioChunk(audioBase64);
+      },
     });
-
-    // Try to capture agent audio and push to STT in chunks (best-effort)
-    try {
-      tryStartAgentAudioCapture();
-    } catch (e) {
-      console.warn('Agent audio capture not available yet:', e);
-    }
+    updateConversationOutputFormat('session-started');
     // Ensure local WS is connected
     connectLocalWS();
   } catch (error) {
@@ -404,7 +542,8 @@ async function stopConversation() {
     await conversation.endSession();
     conversation = null;
   }
-  stopAgentAudioCapture();
+  resetAgentTurnState('stop');
+  clearLocalTextQueue();
   unrealPaused = false;
 }
 
@@ -419,116 +558,6 @@ if (micButton) {
     }
   });
 }
-
-// Attempt to resolve agent output audio stream for recording
-function resolveAgentOutputStream() {
-  try {
-    if (conversation) {
-      // Some SDKs expose direct media streams; if present, prefer them.
-      if (typeof conversation.getOutputMediaStream === 'function') {
-        try {
-          const s = conversation.getOutputMediaStream();
-          if (s) return s;
-        } catch (_) {}
-      }
-      if (conversation.outputStream instanceof MediaStream) {
-        return conversation.outputStream;
-      }
-      if (conversation.audioElement instanceof HTMLAudioElement && typeof conversation.audioElement.captureStream === 'function') {
-        return conversation.audioElement.captureStream();
-      }
-    }
-  } catch (_) {}
-  if (agentAudioEl && typeof agentAudioEl.captureStream === 'function') {
-    try { return agentAudioEl.captureStream(); } catch (_) {}
-  }
-  return null;
-}
-
-function tryStartAgentAudioCapture() {
-  if (recordingActive) return;
-  const stream = resolveAgentOutputStream();
-  if (!stream) {
-    console.warn('Agent audio capture unavailable; relying on onMessage text');
-    return;
-  }
-  // Ensure we have at least one audio track before starting the recorder.
-  const audioTracks = typeof stream.getAudioTracks === 'function' ? stream.getAudioTracks() : [];
-  if (!audioTracks || audioTracks.length === 0) {
-    console.warn('No audio tracks on agent stream yet; waiting for track...');
-    try {
-      const onAddTrack = () => {
-        try { stream.removeEventListener('addtrack', onAddTrack); } catch (_) {}
-        // Defer slightly to let track become live
-        setTimeout(() => { try { tryStartAgentAudioCapture(); } catch (_) {} }, 100);
-      };
-      stream.addEventListener && stream.addEventListener('addtrack', onAddTrack);
-    } catch (_) {}
-    return;
-  }
-  const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : (MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/webm');
-  try {
-    mediaRecorder = new MediaRecorder(stream, { mimeType: mime, audioBitsPerSecond: 128000 });
-  } catch (e) {
-    console.warn('Failed to init MediaRecorder:', e);
-    return;
-  }
-  mediaRecorder.ondataavailable = async (ev) => {
-    if (!ev.data || ev.data.size === 0) return;
-    if (sttInFlight >= MAX_IN_FLIGHT) return;
-    sttInFlight++;
-    try {
-      const text = await sttChunk(ev.data);
-      if (text) {
-        console.log(`[STT] Partial transcript: "${text}"`);
-        // Feed partial transcription into the Unreal bridge.
-        if (unrealPaused) {
-          console.log('[STT] Paused; dropping partial transcript.');
-        } else {
-          sendAgentDelta(text, 'stt');
-          appendMessage('agent', text, 'stt');
-        }
-      }
-    } catch (err) {
-      console.error('STT chunk failed:', err);
-    } finally {
-      sttInFlight--;
-    }
-  };
-  mediaRecorder.onerror = (e) => console.error('MediaRecorder error', e);
-  try {
-    mediaRecorder.start(CHUNK_MS);
-  } catch (e) {
-    console.warn('MediaRecorder.start failed:', e);
-    try { mediaRecorder.stop(); } catch (_) {}
-    mediaRecorder = null;
-    return;
-  }
-  recordingActive = true;
-}
-
-function stopAgentAudioCapture() {
-  try { if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop(); } catch (_) {}
-  mediaRecorder = null;
-  recordingActive = false;
-  resetAgentTurnState();
-}
-
-async function sttChunk(blob) {
-  const contentType = blob.type || 'audio/webm';
-  const res = await fetch('http://localhost:3001/api/stt-chunk', {
-    method: 'POST',
-    headers: { 'Content-Type': contentType },
-    body: blob,
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`STT HTTP ${res.status}: ${t}`);
-  }
-  const data = await res.json();
-  return data && (data.text || data.transcript || data.transcription || data.result);
-}
-
 
 // Initialize status and local WS
 setConnectedUI(false);

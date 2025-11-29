@@ -40,15 +40,12 @@ Notes
 - The frontend imports `@elevenlabs/client` and calls `Conversation.startSession` with either `agentId` or `signedUrl`, mirroring the ElevenLabs quickstart.
 - For production, add error handling and URL refresh logic for expiring signed URLs.
 
-Voice-to-Text streaming to local WebSocket
-- Sources of text:
-  - `onMessage` from the Agents SDK (used for UI display only)
-- Incremental agent text forwarding:
-  - Agent text from `onMessage` and optional STT partials is diffed and any new portion is streamed to `LOCAL_WS_URL` as `lstext^<chunk>`.
-  - Interruptions emit `action^pause`, mute audio, and clear any pending text so Unreal stops immediately.
-  - New speaking turns reset the diff tracker so streaming restarts cleanly after an interruption.
+Audio chunk forwarding to local WebSocket
+- ElevenLabs emits agent audio chunks via the SDK `onAudio` callback. The frontend converts those PCM/µ-law buffers into small `.wav` blobs (preserving the SDK-provided sample rate) before enqueueing them.
+- Each blob is POSTed to `/api/save-agent-audio`, which writes it into the git-ignored `audios/` directory and responds with the absolute filesystem path.
+- Filepaths stream to `LOCAL_WS_URL` as `lstext^<absolute_path>` in the exact order the SDK delivered the audio; the queue prevents overlapping sends and automatically replays any pending paths once the Unreal bridge reconnects.
+- Interruptions (`action^pause`) still mute the agent, clear queued payloads, and block new filepaths until the next speaking turn resumes so Unreal stops immediately.
 - Configure in `client/script.js`:
-  - `LOCAL_WS_URL` for your local WebSocket
-  - `CHUNK_MS` MediaRecorder pacing; lower is lower latency
-  - `MAX_IN_FLIGHT` caps concurrent STT requests
+  - `LOCAL_WS_URL` for your local WebSocket target
+  - `AUDIO_SAVE_ENDPOINT` if your backend runs somewhere other than `http://localhost:3001/api/save-agent-audio`
   - `SEND_STOP_ON_INTERRUPT` and `STOP_CONTROL_MESSAGE` if your Unreal server supports an explicit stop control signal

@@ -1,5 +1,5 @@
 node_modules/
 dist/
+audios/
 .env
 .DS_Store
-
