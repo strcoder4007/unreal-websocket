@@ -17,12 +17,12 @@ const wsBadge = document.getElementById('wsBadge');
 const AGENT_ID = 'agent_9201k6ytycfdeyzrhkxaz5kfc6vn'; // TODO: replace with your actual agent ID
 
 // If using a private agent, set this to true and ensure the backend is running
-// on http://localhost:3001 as implemented in backend/server.js.
+// on http://localhost:8000 as implemented in backend/server.js.
 const SIGNED_URL_FLOW = false;
 
-// Local WebSocket forwarder (sends lstext^<text> to ws://127.0.0.1:8080)
+// Local WebSocket forwarder (sends filepath^<text> to ws://127.0.0.1:8080)
 const LOCAL_WS_URL = 'ws://127.0.0.1:8080';
-const AUDIO_SAVE_ENDPOINT = 'http://localhost:3001/api/save-agent-audio'; // backend endpoint that persists agent audio chunks
+const AUDIO_SAVE_ENDPOINT = 'http://localhost:8000/api/save-agent-audio'; // backend endpoint that persists agent audio chunks
 let localWS = null;
 let localWSConnected = false;
 let localWSQueue = [];
@@ -165,15 +165,15 @@ function sendPauseToUnreal() {
 }
 
 function clearLocalTextQueue() {
-  // Remove any queued lstext^ payloads (now carrying file paths) that haven't been flushed yet
+  // Remove any queued filepath^ payloads (now carrying file paths) that haven't been flushed yet
   if (Array.isArray(localWSQueue) && localWSQueue.length) {
     const before = localWSQueue.length;
     localWSQueue = localWSQueue.filter((p) => {
-      try { return !(typeof p === 'string' && p.startsWith('lstext^')); }
+      try { return !(typeof p === 'string' && p.startsWith('filepath^')); }
       catch { return true; }
     });
     const after = localWSQueue.length;
-    if (before !== after) console.log(`[WS] Cleared ${before - after} queued lstext^ payload(s) on interrupt.`);
+    if (before !== after) console.log(`[WS] Cleared ${before - after} queued filepath^ payload(s) on interrupt.`);
   }
 }
 
@@ -190,7 +190,7 @@ function forwardAudioPathToLocalWS(filepath) {
   lastForwardedPath = safePath;
   lastForwardedPathAt = now;
   console.log(`[WS-direct] Sending audio path to LOCAL_WS_URL: "${safePath}"`);
-  _sendLocal(`lstext^${safePath}`);
+  _sendLocal(`filepath^${safePath}`);
 }
 
 function clearPendingAudioChunks(reason = 'reset') {
@@ -410,15 +410,6 @@ function updateMicState(state) {
   micButton.setAttribute('aria-label', micButton.title);
 }
 
-async function getSignedUrl() {
-  const response = await fetch('http://localhost:3001/api/get-signed-url');
-  if (!response.ok) {
-    throw new Error(`Failed to get signed url: ${response.statusText}`);
-  }
-  const { signedUrl } = await response.json();
-  return signedUrl;
-}
-
 async function startConversation() {
   try {
     // Request microphone permission before starting
@@ -426,7 +417,7 @@ async function startConversation() {
 
     const options = {};
     if (SIGNED_URL_FLOW) {
-      const signedUrl = await getSignedUrl();
+      const signedUrl = "";
       options.signedUrl = signedUrl;
     } else {
       if (!AGENT_ID || AGENT_ID === 'YOUR_AGENT_ID') {

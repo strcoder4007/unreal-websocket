@@ -43,7 +43,7 @@ Notes
 Audio chunk forwarding to local WebSocket
 - ElevenLabs emits agent audio chunks via the SDK `onAudio` callback. The frontend converts those PCM/µ-law buffers into small `.wav` blobs (preserving the SDK-provided sample rate) before enqueueing them.
 - Each blob is POSTed to `/api/save-agent-audio`, which writes it into the git-ignored `audios/` directory and responds with the absolute filesystem path.
-- Filepaths stream to `LOCAL_WS_URL` as `lstext^<absolute_path>` in the exact order the SDK delivered the audio; the queue prevents overlapping sends and automatically replays any pending paths once the Unreal bridge reconnects.
+- Filepaths stream to `LOCAL_WS_URL` as `filepath^<absolute_path>` in the exact order the SDK delivered the audio; the queue prevents overlapping sends and automatically replays any pending paths once the Unreal bridge reconnects.
 - Interruptions (`action^pause`) still mute the agent, clear queued payloads, and block new filepaths until the next speaking turn resumes so Unreal stops immediately.
 - Configure in `client/script.js`:
   - `LOCAL_WS_URL` for your local WebSocket target

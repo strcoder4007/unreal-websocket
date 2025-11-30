@@ -144,9 +144,9 @@
 
     btnConnect.addEventListener("click", () => connect(inputUrl.value.trim()));
 
-    btnSend1.addEventListener("click", () => sendMessage("lstext^" + para1.value.trim()));
-    btnSend2.addEventListener("click", () => sendMessage("lstext^" + para2.value.trim()));
-    btnSend3.addEventListener("click", () => sendMessage("lstext^" + para3.value.trim()));
+    btnSend1.addEventListener("click", () => sendMessage("filepath^" + para1.value.trim()));
+    btnSend2.addEventListener("click", () => sendMessage("filepath^" + para2.value.trim()));
+    btnSend3.addEventListener("click", () => sendMessage("filepath^" + para3.value.trim()));
 
     btnPlay.addEventListener("click", () => sendMessage("action^play"));
     btnPause.addEventListener("click", () => sendMessage("action^pause"));
